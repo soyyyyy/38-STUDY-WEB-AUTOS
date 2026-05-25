@@ -10,9 +10,18 @@ if [ -z "${GEMINI_API_KEY:-}" ]; then
   exit 1
 fi
 
+echo "TARGET_BRANCH=$TARGET_BRANCH"
+echo "SOURCE_BRANCH=$SOURCE_BRANCH"
+
 git fetch origin "$TARGET_BRANCH:refs/remotes/origin/$TARGET_BRANCH" --depth=1
 
+echo "Fetched target branch successfully"
+echo "HEAD=$(git rev-parse HEAD)"
+echo "TARGET_REF=$(git rev-parse "origin/$TARGET_BRANCH")"
+
 MERGE_BASE=$(git merge-base "origin/$TARGET_BRANCH" HEAD)
+echo "MERGE_BASE=$MERGE_BASE"
+
 COMMITS=$(git log --no-merges "$MERGE_BASE..HEAD" --oneline)
 DIFF_STATS=$(git diff --stat "$MERGE_BASE..HEAD")
 DIFF_CONTENT=$(git diff --unified=3 "$MERGE_BASE..HEAD" \
@@ -95,6 +104,8 @@ REQUEST_BODY=$(jq -n --arg prompt "$PROMPT" '{
   }
 }')
 
+echo "Calling Gemini API..."
+
 GEMINI_RESPONSE=""
 for attempt in 1 2 3; do
   HTTP_RESPONSE=$(curl -sS -w '\n%{http_code}' -X POST \
@@ -122,7 +133,7 @@ FULL_RESPONSE=$(printf '%s' "$GEMINI_RESPONSE" | jq -r '
   .candidates[0].content.parts
   | map(.text // "")
   | join("")
-')
+' | sed '/^```/d')
 
 if [ -z "$FULL_RESPONSE" ] || [ "$FULL_RESPONSE" = "null" ]; then
   echo "Gemini API returned an empty response." >&2
@@ -130,24 +141,23 @@ if [ -z "$FULL_RESPONSE" ] || [ "$FULL_RESPONSE" = "null" ]; then
   exit 1
 fi
 
-PR_TITLE=$(printf '%s\n' "$FULL_RESPONSE" | grep '^TITLE:' | sed 's/^TITLE: //')
+echo "Gemini response received"
+printf '%s\n' "$FULL_RESPONSE" | head -n 20
+
+PR_TITLE=$(printf '%s\n' "$FULL_RESPONSE" | sed -n 's/^TITLE:[[:space:]]*//p' | head -n 1)
 PR_BODY_DRAFT=$(printf '%s\n' "$FULL_RESPONSE" | sed '1,/^---$/d')
 
 if [ -z "$PR_TITLE" ] || [ -z "$PR_BODY_DRAFT" ]; then
   echo "Failed to parse Gemini response." >&2
+  echo "$FULL_RESPONSE" >&2
   exit 1
 fi
-
-PR_BODY=$(cat <<EOF
-$PR_BODY_DRAFT
-EOF
-)
 
 TITLE_FILE=$(mktemp)
 BODY_FILE=$(mktemp)
 
 printf '%s' "$PR_TITLE" > "$TITLE_FILE"
-printf '%s' "$PR_BODY" > "$BODY_FILE"
+printf '%s' "$PR_BODY_DRAFT" > "$BODY_FILE"
 
 {
   echo "should_create=true"
