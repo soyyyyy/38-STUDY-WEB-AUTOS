@@ -10,7 +10,7 @@ if [ -z "${GEMINI_API_KEY:-}" ]; then
   exit 1
 fi
 
-git fetch origin "$TARGET_BRANCH" --depth=1
+git fetch origin "$TARGET_BRANCH:refs/remotes/origin/$TARGET_BRANCH" --depth=1
 
 MERGE_BASE=$(git merge-base "origin/$TARGET_BRANCH" HEAD)
 COMMITS=$(git log --no-merges "$MERGE_BASE..HEAD" --oneline)
