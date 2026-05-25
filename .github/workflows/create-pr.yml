@@ -1,0 +1,107 @@
+name: Automated PR Creation
+
+on:
+  push:
+    branches-ignore:
+      - main
+      - test
+
+env:
+  TARGET_BRANCH: test
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: create-pr-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  create-pull-request:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for existing PR
+        id: check-pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          SOURCE_BRANCH="${GITHUB_REF#refs/heads/}"
+          existing_pr=$(gh pr list \
+            --head "$SOURCE_BRANCH" \
+            --base "${TARGET_BRANCH}" \
+            --state open \
+            --json number \
+            --jq '.[0].number')
+
+          if [ -n "$existing_pr" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "PR already exists: #$existing_pr"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Generate PR title and description
+        if: steps.check-pr.outputs.exists == 'false'
+        id: generate-pr
+        env:
+          GEMINI_API_KEY: ${{ secrets.PR_GEMINI_API_KEY }}
+        run: |
+          SOURCE_BRANCH="${GITHUB_REF#refs/heads/}"
+          bash .github/scripts/generate-pr-description.sh \
+            "${TARGET_BRANCH}" \
+            "$SOURCE_BRANCH"
+
+      - name: Create Pull Request
+        if: steps.check-pr.outputs.exists == 'false' && steps.generate-pr.outputs.should_create == 'true'
+        continue-on-error: true
+        id: create-pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TZ: Asia/Seoul
+        run: |
+          SOURCE_BRANCH="${GITHUB_REF#refs/heads/}"
+          gh pr create \
+            --base "${TARGET_BRANCH}" \
+            --head "$SOURCE_BRANCH" \
+            --title "$(cat "${{ steps.generate-pr.outputs.title_file }}")" \
+            --body-file "${{ steps.generate-pr.outputs.body_file }}"
+
+      - name: Publish PR draft summary
+        if: steps.check-pr.outputs.exists == 'false' && steps.generate-pr.outputs.should_create == 'true'
+        env:
+          SOURCE_BRANCH: ${{ github.ref_name }}
+        run: |
+          {
+            echo "## PR Draft Suggestion"
+            echo
+            if [ "${{ steps.create-pr.outcome }}" = "success" ]; then
+              echo "- Status: PR created successfully."
+            else
+              echo "- Status: Automatic PR creation failed. Use the draft below to open the PR manually."
+              echo "- Reason: GitHub Actions may not have permission to create pull requests in this repository."
+            fi
+            echo "- Base branch: ${TARGET_BRANCH}"
+            echo "- Head branch: ${SOURCE_BRANCH}"
+            echo
+            echo "### Suggested Title"
+            echo
+            cat "${{ steps.generate-pr.outputs.title_file }}"
+            echo
+            echo "### Suggested Draft Body"
+            echo
+            echo '```md'
+            cat "${{ steps.generate-pr.outputs.body_file }}"
+            echo
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Skip when diff is empty
+        if: steps.check-pr.outputs.exists == 'false' && steps.generate-pr.outputs.should_create != 'true'
+        run: echo "No meaningful diff found against test."

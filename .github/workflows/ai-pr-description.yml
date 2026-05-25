@@ -1,0 +1,182 @@
+name: AI PR Summary
+
+on:
+  pull_request:
+    branches:
+      - test
+      - main
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - ready_for_review
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: ai-pr-summary-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  update-pr-summary:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Build PR diff
+        id: diff
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          git fetch origin "${BASE_REF}" --depth=1
+          git diff --unified=3 "origin/${BASE_REF}...HEAD" \
+            -- . \
+            ':(exclude)package-lock.json' \
+            ':(exclude)yarn.lock' \
+            ':(exclude)pnpm-lock.yaml' \
+            ':(exclude)dist/**' \
+            ':(exclude).gitignore' \
+            > pr.diff
+
+          if [ ! -s pr.diff ]; then
+            echo "has_diff=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_diff=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Generate AI summary and update PR body
+        if: steps.diff.outputs.has_diff == 'true'
+        uses: actions/github-script@v7
+        env:
+          GEMINI_API_KEY: ${{ secrets.PR_GEMINI_API_KEY }}
+          PR_DIFF_PATH: pr.diff
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+
+            if (!process.env.GEMINI_API_KEY) {
+              core.setFailed('PR_GEMINI_API_KEY secret is not configured.');
+              return;
+            }
+
+            const diff = fs.readFileSync(process.env.PR_DIFF_PATH, 'utf8');
+            const existingBody = context.payload.pull_request.body ?? '';
+            const startMarker = '<!-- ai-pr-summary:start -->';
+            const endMarker = '<!-- ai-pr-summary:end -->';
+            const rawManualBody = existingBody.includes(startMarker)
+              ? existingBody.split(startMarker)[0].trimEnd()
+              : existingBody.trimEnd();
+
+            const manualBody = rawManualBody
+              .replace(/(?:\n\s*---\s*)+$/g, '')
+              .trimEnd();
+
+            const prompt = `
+            당신은 GitHub Pull Request 하단에 붙는 AI 요약 블록을 작성하는 한국어 기술 문서 작성자입니다.
+
+            규칙:
+            - 반드시 한국어 마크다운으로 작성합니다.
+            - 변경 사항은 반드시 diff에 근거해 작성합니다.
+            - 확실하지 않은 내용은 추측하지 말고 "확인 필요"라고 적습니다.
+            - 각 섹션은 1~3개의 bullet로 짧고 선명하게 작성합니다.
+            - 아래 형식을 정확히 지킵니다.
+
+            출력 형식:
+            ## 🤖 AI PR 분석 결과
+            _아래 내용은 변경 diff를 기준으로 자동 생성되었습니다._
+
+            ### 📝 Summary
+            - ...
+
+            ### ⚒️ 상세 변경 사항
+            - ...
+
+            ### 🔍 리뷰어 주의사항
+            - ...
+
+            PR 정보:
+            - base branch: ${context.payload.pull_request.base.ref}
+            - head branch: ${context.payload.pull_request.head.ref}
+            - title: ${context.payload.pull_request.title}
+
+            상세 diff:
+            ---
+            ${diff}
+            ---
+            `;
+
+            const endpoint =
+              'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=' +
+              encodeURIComponent(process.env.GEMINI_API_KEY);
+            const payload = {
+              contents: [{ role: 'user', parts: [{ text: prompt }] }],
+              generationConfig: { temperature: 0.2 },
+            };
+
+            let response;
+            let lastErrorText = '';
+
+            for (let attempt = 1; attempt <= 3; attempt += 1) {
+              response = await fetch(endpoint, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload),
+              });
+
+              if (response.ok) {
+                break;
+              }
+
+              lastErrorText = await response.text();
+              const shouldRetry = response.status === 429 || response.status >= 500;
+
+              if (!shouldRetry || attempt === 3) {
+                core.setFailed(
+                  `Gemini API request failed after ${attempt} attempt(s): ${response.status} ${lastErrorText}`,
+                );
+                return;
+              }
+
+              await new Promise((resolve) => setTimeout(resolve, attempt * 2000));
+            }
+
+            const data = await response.json();
+            const generatedText =
+              data.candidates?.[0]?.content?.parts
+                ?.map((part) => part.text || '')
+                .join('')
+                .trim() || '';
+
+            if (!generatedText) {
+              core.setFailed('Gemini API returned an empty response.');
+              return;
+            }
+
+            const aiSection = `${startMarker}
+
+            ${generatedText}
+
+            ${endMarker}`;
+
+            const nextBody = manualBody
+              ? `${manualBody}\n\n---\n\n${aiSection}`
+              : aiSection;
+
+            await github.rest.pulls.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number,
+              body: nextBody,
+            });
+
+      - name: Skip when diff is empty
+        if: steps.diff.outputs.has_diff != 'true'
+        run: echo "No meaningful diff found after exclusions."
